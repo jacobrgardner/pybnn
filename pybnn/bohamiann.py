@@ -66,6 +66,7 @@ class Bohamiann(BaseModel):
                  normalize_output: bool = True,
                  sampling_method: str = "adaptive_sghmc",
                  use_double_precision: bool = True,
+                 use_gpu: bool = False,
                  metrics=(nn.MSELoss,),
                  likelihood_function=nll,
                  print_every_n_steps=100,
@@ -102,6 +103,7 @@ class Bohamiann(BaseModel):
         self.get_network = get_network
         self.is_trained = False
         self.use_double_precision = use_double_precision
+        self.use_gpu = use_gpu
         self.sampling_method = sampling_method
         self.sampled_weights = []  # type: typing.List[typing.Tuple[np.ndarray]]
         self.likelihood_function = likelihood_function
@@ -216,6 +218,10 @@ class Bohamiann(BaseModel):
             else:
                 y_train_ = torch.from_numpy(y_train).float()
 
+        if self.use_gpu:
+            x_train_ = x_train_.cuda()
+            y_train_ = y_train_.cuda()
+
         train_loader = infinite_dataloader(
             data_utils.DataLoader(
                 data_utils.TensorDataset(x_train_, y_train_),
@@ -237,6 +243,9 @@ class Bohamiann(BaseModel):
                 self.model = self.get_network(input_dimensionality=input_dimensionality).double()
             else:
                 self.model = self.get_network(input_dimensionality=input_dimensionality).float()
+
+            if self.use_gpu:
+                self.model = self.model.cuda()
 
             if self.sampling_method == "adaptive_sghmc":
                 self.sampler = AdaptiveSGHMC(self.model.parameters(),
@@ -262,21 +271,30 @@ class Bohamiann(BaseModel):
         batch_generator = islice(enumerate(train_loader), num_steps)
 
         for step, (x_batch, y_batch) in batch_generator:
+
+            start_iter_time = time.time()
+            # from IPython.core.debugger import set_trace
+            # set_trace()
             self.sampler.zero_grad()
             loss = self.likelihood_function(input=self.model(x_batch), target=y_batch)
             # Add prior. Note the gradient is computed by: g_prior + N/n sum_i grad_theta_xi see Eq 4
             # in Welling and Whye The 2011. Because of that we divide here by N=num of datapoints since
             # in the sample we rescale the gradient by N again
-            loss -= log_variance_prior(self.model(x_batch)[:, 1].view((-1, 1))) / num_datapoints
+            loss -= log_variance_prior(self.model(x_batch)[:, 1].view(-1, 1)) / num_datapoints
             loss -= weight_prior(self.model.parameters(), dtype=dtype) / num_datapoints
             loss.backward()
             self.sampler.step()
+            print(f'Time taken on step {step}: {time.time() - start_iter_time}')
 
             if verbose and step > 0 and step % self.print_every_n_steps == 0:
 
                 # compute the training performance of the ensemble
                 if len(self.sampled_weights) > 1:
                     mu, var = self.predict(x_train)
+
+                    mu = mu.cpu()
+                    var = var.cpu()
+
                     total_nll = -np.mean(norm.logpdf(y_train, loc=mu, scale=np.sqrt(var)))
                     total_mse = np.mean((y_train - mu) ** 2)
                 # in case we do not have an ensemble we compute the performance of the last weight sample
@@ -284,12 +302,12 @@ class Bohamiann(BaseModel):
                     f = self.model(x_train_)
 
                     if self.do_normalize_output:
-                        mu = zero_mean_unit_var_denormalization(f[:, 0], self.y_mean, self.y_std).data.numpy()
+                        mu = zero_mean_unit_var_denormalization(f[:, 0], self.y_mean, self.y_std).data.cpu().numpy()
                         var = torch.exp(f[:, 1]) * self.y_std ** 2
-                        var = var.data.numpy()
+                        var = var.data.cpu().numpy()
                     else:
-                        mu = f[:, 0].data.numpy()
-                        var = np.exp(f[:, 1].data.numpy())
+                        mu = f[:, 0].data.cpu().numpy()
+                        var = np.exp(f[:, 1].data.cpu().numpy())
                     total_nll = -np.mean(norm.logpdf(y_train, loc=mu, scale=np.sqrt(var)))
                     total_mse = np.mean((y_train - mu) ** 2)
 
@@ -417,13 +435,21 @@ class Bohamiann(BaseModel):
         if self.do_normalize_input:
             x_test_, *_ = self.normalize_input(x_test_, self.x_mean, self.x_std)
 
+        if self.use_double_precision:
+            x_test_ = x_test_.double()
+        else:
+            x_test_ = x_test_.float()
+
+        if self.use_gpu:
+            x_test_ = x_test_.cuda()
+
         def network_predict(x_test_, weights):
             with torch.no_grad():
                 self.network_weights = weights
                 if self.use_double_precision:
-                    return self.model(torch.from_numpy(x_test_).double()).numpy()
+                    return self.model(torch.from_numpy(x_test_).double()).cpu().numpy()
                 else:
-                    return self.model(torch.from_numpy(x_test_).float()).numpy()
+                    return self.model(torch.from_numpy(x_test_).float()).cpu().numpy()
 
         logging.debug("Predicting with %d networks." % len(self.sampled_weights))
         network_outputs = np.array([
